@@ -106,6 +106,26 @@ struct CachedToken {
     expires_at: Instant,
 }
 
+/// A token endpoint response nono can use: a Bearer token.
+struct TokenResponse {
+    access_token: Zeroizing<String>,
+    expires_in: Duration,
+    /// The response omitted `token_type`. RFC 6749 §5.1 makes it required,
+    /// but some servers leave it out, so the token is used as Bearer.
+    token_type_missing: bool,
+}
+
+/// Custom Debug that redacts the access token.
+impl std::fmt::Debug for TokenResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenResponse")
+            .field("access_token", &"[REDACTED]")
+            .field("expires_in", &self.expires_in)
+            .field("token_type_missing", &self.token_type_missing)
+            .finish()
+    }
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // TokenCache implementation
 // ────────────────────────────────────────────────────────────────────────────
@@ -119,17 +139,18 @@ impl TokenCache {
     /// (DNS, TCP, TLS, non-200, malformed JSON). The calling code skips the
     /// route so the proxy can still start for other routes.
     pub async fn new(config: OAuth2ExchangeConfig, tls_connector: TlsConnector) -> Result<Self> {
-        let (access_token, expires_in) = exchange_token(&config, &tls_connector).await?;
+        let response = exchange_token(&config, &tls_connector).await?;
+        warn_if_token_type_missing(&response, &config.token_url);
 
-        let expires_at = Instant::now() + expires_in;
+        let expires_at = Instant::now() + response.expires_in;
         debug!(
             "OAuth2 initial token acquired, expires in {}s",
-            expires_in.as_secs()
+            response.expires_in.as_secs()
         );
 
         Ok(Self {
             token: Arc::new(RwLock::new(CachedToken {
-                access_token,
+                access_token: response.access_token,
                 expires_at,
             })),
             config,
@@ -203,17 +224,17 @@ impl TokenCache {
         }
 
         match exchange_token(&self.config, &self.tls_connector).await {
-            Ok((new_token, expires_in)) => {
+            Ok(response) => {
                 debug!(
                     "OAuth2 token refreshed, expires in {}s",
-                    expires_in.as_secs()
+                    response.expires_in.as_secs()
                 );
                 // Register before the token is handed out for injection.
                 if let Some(target) = &self.secret_registry {
-                    target.register(new_token.as_str());
+                    target.register(response.access_token.as_str());
                 }
-                guard.access_token = new_token;
-                guard.expires_at = Instant::now() + expires_in;
+                guard.access_token = response.access_token;
+                guard.expires_at = Instant::now() + response.expires_in;
                 guard.access_token.clone()
             }
             Err(e) => {
@@ -243,12 +264,10 @@ fn token_request_target(parsed: &url::Url) -> String {
 
 /// Perform a single `client_credentials` token exchange against the token
 /// endpoint described in `config`.
-///
-/// Returns `(access_token, expires_in_duration)`.
 async fn exchange_token(
     config: &OAuth2ExchangeConfig,
     tls_connector: &TlsConnector,
-) -> Result<(Zeroizing<String>, Duration)> {
+) -> Result<TokenResponse> {
     let parsed = url::Url::parse(&config.token_url).map_err(|e| {
         ProxyError::OAuth2Exchange(format!("invalid token_url '{}': {}", config.token_url, e))
     })?;
@@ -449,13 +468,37 @@ fn build_token_request_body(
 
 /// Parse a standard OAuth2 token response JSON.
 ///
-/// Expects `{"access_token": "...", "expires_in": 3600, ...}`.
+/// Expects `{"access_token": "...", "token_type": "Bearer", "expires_in": 3600, ...}`.
 /// - `access_token` is required.
+/// - `token_type` must be `Bearer` (any case) or absent. nono injects every
+///   token as `Authorization: Bearer`, and RFC 6749 §7.1 says a client MUST
+///   NOT use a token whose type it does not understand.
 /// - `expires_in` defaults to [`DEFAULT_EXPIRES_IN_SECS`] if missing.
-fn parse_token_response(json: &str) -> Result<(Zeroizing<String>, Duration)> {
+fn parse_token_response(json: &str) -> Result<TokenResponse> {
     let value: serde_json::Value = serde_json::from_str(json).map_err(|e| {
         ProxyError::OAuth2Exchange(format!("invalid JSON from token endpoint: {}", e))
     })?;
+
+    let token_type_missing = match value.get("token_type") {
+        None | Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::String(t)) if t.eq_ignore_ascii_case("bearer") => false,
+        Some(serde_json::Value::String(t)) => {
+            // Debug formatting escapes control characters; the cap keeps a
+            // hostile server from filling the log.
+            let shown: String = t.chars().take(64).collect();
+            return Err(ProxyError::OAuth2Exchange(format!(
+                "token endpoint issued token_type {shown:?}; nono can only inject \
+                 Bearer tokens (RFC 6749 §7.1)"
+            )));
+        }
+        Some(_) => {
+            return Err(ProxyError::OAuth2Exchange(
+                "token endpoint returned a non-string token_type; nono can only inject \
+                 Bearer tokens (RFC 6749 §7.1)"
+                    .to_string(),
+            ));
+        }
+    };
 
     let access_token = value
         .get("access_token")
@@ -469,10 +512,23 @@ fn parse_token_response(json: &str) -> Result<(Zeroizing<String>, Duration)> {
         .and_then(|v| v.as_u64())
         .unwrap_or(DEFAULT_EXPIRES_IN_SECS);
 
-    Ok((
-        Zeroizing::new(access_token.to_string()),
-        Duration::from_secs(expires_in_secs),
-    ))
+    Ok(TokenResponse {
+        access_token: Zeroizing::new(access_token.to_string()),
+        expires_in: Duration::from_secs(expires_in_secs),
+        token_type_missing,
+    })
+}
+
+/// Warn once per token cache, on its first exchange, when the endpoint
+/// omits `token_type`. Refreshes stay quiet so a long-lived route does not
+/// repeat the same warning every token lifetime.
+fn warn_if_token_type_missing(response: &TokenResponse, token_url: &str) {
+    if response.token_type_missing {
+        warn!(
+            "OAuth2 token response from {} has no token_type; using the token as Bearer",
+            token_url
+        );
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -508,7 +564,7 @@ impl SpiffeAssertionTokenCache {
         extra_params: Vec<(String, String)>,
         tls_connector: TlsConnector,
     ) -> Result<Self> {
-        let (access_token, expires_in, workload_spiffe_id) = exchange_jwt_assertion(
+        let (response, workload_spiffe_id) = exchange_jwt_assertion(
             &token_url,
             &jwt_source,
             &assertion_audience,
@@ -516,11 +572,12 @@ impl SpiffeAssertionTokenCache {
             &tls_connector,
         )
         .await?;
+        warn_if_token_type_missing(&response, &token_url);
 
         Ok(Self {
             token: Arc::new(RwLock::new(CachedToken {
-                access_token,
-                expires_at: Instant::now() + expires_in,
+                access_token: response.access_token,
+                expires_at: Instant::now() + response.expires_in,
             })),
             jwt_source,
             token_url,
@@ -571,16 +628,16 @@ impl SpiffeAssertionTokenCache {
         )
         .await
         {
-            Ok((new_token, expires_in, _)) => {
+            Ok((response, _)) => {
                 debug!(
                     "OAuth2 jwt-bearer token refreshed, expires in {}s",
-                    expires_in.as_secs()
+                    response.expires_in.as_secs()
                 );
                 if let Some(target) = &self.secret_registry {
-                    target.register(new_token.as_str());
+                    target.register(response.access_token.as_str());
                 }
-                guard.access_token = new_token;
-                guard.expires_at = Instant::now() + expires_in;
+                guard.access_token = response.access_token;
+                guard.expires_at = Instant::now() + response.expires_in;
                 Ok(guard.access_token.clone())
             }
             // SVID fetch failed — workload identity is gone; fail the request.
@@ -603,7 +660,7 @@ async fn exchange_jwt_assertion(
     audience: &[String],
     extra_params: &[(String, String)],
     tls_connector: &TlsConnector,
-) -> Result<(Zeroizing<String>, Duration, String)> {
+) -> Result<(TokenResponse, String)> {
     let (assertion, spiffe_id) = jwt_source.fetch_token(audience).await?;
 
     let mut body = Zeroizing::new(format!(
@@ -726,8 +783,7 @@ async fn exchange_jwt_assertion(
             "token endpoint returned HTTP {status}: {preview}"
         )));
     }
-    let (token, expires) = parse_token_response(&body)?;
-    Ok((token, expires, spiffe_id))
+    Ok((parse_token_response(&body)?, spiffe_id))
 }
 
 /// Decode an HTTP/1.1 chunked-encoded body into a plain string.
@@ -798,9 +854,9 @@ mod tests {
             second.len(),
             second
         );
-        let (token, expires) = exchange_mock_token_response(response).await.unwrap();
-        assert!(token.as_str() == "fake-token");
-        assert_eq!(expires, Duration::from_secs(3600));
+        let token = exchange_mock_token_response(response).await.unwrap();
+        assert!(token.access_token.as_str() == "fake-token");
+        assert_eq!(token.expires_in, Duration::from_secs(3600));
     }
 
     #[tokio::test]
@@ -811,28 +867,103 @@ mod tests {
             FAKE_TOKEN_JSON.len(),
             FAKE_TOKEN_JSON
         );
-        let (token, expires) = exchange_mock_token_response(response).await.unwrap();
-        assert!(token.as_str() == "fake-token");
-        assert_eq!(expires, Duration::from_secs(3600));
+        let token = exchange_mock_token_response(response).await.unwrap();
+        assert!(token.access_token.as_str() == "fake-token");
+        assert_eq!(token.expires_in, Duration::from_secs(3600));
     }
 
     // ── parse_token_response ─────────────────────────────────────────────
 
     #[test]
+    fn test_parse_token_response_token_type() {
+        // want: Ok(token_type_missing) or Err(error substring)
+        type Want = std::result::Result<bool, &'static str>;
+        // (name, token_type JSON or "" to omit the field, want)
+        let cases: &[(&str, &str, Want)] = &[
+            ("Bearer", r#""Bearer""#, Ok(false)),
+            ("lowercase", r#""bearer""#, Ok(false)),
+            ("uppercase", r#""BEARER""#, Ok(false)),
+            ("missing", "", Ok(true)),
+            ("null", "null", Ok(true)),
+            ("DPoP", r#""DPoP""#, Err(r#"token_type "DPoP""#)),
+            ("N_A", r#""N_A""#, Err(r#"token_type "N_A""#)),
+            ("mac", r#""mac""#, Err(r#"token_type "mac""#)),
+            ("empty", r#""""#, Err(r#"token_type """#)),
+            ("padded", r#"" Bearer""#, Err(r#"token_type " Bearer""#)),
+            (
+                "control characters are escaped",
+                r#""Bearer\r\nX-Chang: 1""#,
+                Err(r#"token_type "Bearer\r\nX-Chang: 1""#),
+            ),
+            ("number", "7", Err("non-string token_type")),
+            (
+                "object",
+                r#"{"type":"Bearer"}"#,
+                Err("non-string token_type"),
+            ),
+        ];
+        for (name, token_type, want) in cases {
+            let field = match *token_type {
+                "" => String::new(),
+                t => format!(r#","token_type":{t}"#),
+            };
+            let json = format!(r#"{{"access_token":"troy-barnes-token"{field}}}"#);
+            match (parse_token_response(&json), want) {
+                (Ok(token), Ok(missing)) => {
+                    assert_eq!(token.token_type_missing, *missing, "{name}");
+                    assert_eq!(token.access_token.as_str(), "troy-barnes-token", "{name}");
+                }
+                (Err(e), Err(want)) => {
+                    let msg = e.to_string();
+                    assert!(msg.contains(want), "{name}: {msg}");
+                    assert!(msg.contains("Bearer tokens"), "{name}: {msg}");
+                    assert!(!msg.contains("troy-barnes-token"), "{name}: token leaked");
+                    assert!(!msg.contains('\n'), "{name}: raw newline in {msg:?}");
+                }
+                (got, want) => panic!("{name}: got {got:?}, want {want:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_token_response_long_token_type_is_capped() {
+        let long = "x".repeat(10_000);
+        let json = format!(r#"{{"access_token":"tok","token_type":"{long}"}}"#);
+        let msg = parse_token_response(&json).unwrap_err().to_string();
+        assert!(
+            msg.len() < 300,
+            "error message not capped: {} bytes",
+            msg.len()
+        );
+    }
+
+    #[test]
+    fn test_token_response_debug_redacts_access_token() {
+        let token = parse_token_response(r#"{"access_token":"abed-nadir-secret"}"#).unwrap();
+        let debug = format!("{token:?}");
+        assert!(!debug.contains("abed-nadir-secret"), "{debug}");
+        assert!(debug.contains("token_type_missing: true"), "{debug}");
+    }
+
+    #[test]
     fn test_parse_token_response_success() {
         let json =
             r#"{"access_token":"eyJhbGciOiJSUzI1NiJ9","token_type":"Bearer","expires_in":3600}"#;
-        let (token, expires) = parse_token_response(json).unwrap();
-        assert_eq!(token.as_str(), "eyJhbGciOiJSUzI1NiJ9");
-        assert_eq!(expires, Duration::from_secs(3600));
+        let token = parse_token_response(json).unwrap();
+        assert_eq!(token.access_token.as_str(), "eyJhbGciOiJSUzI1NiJ9");
+        assert_eq!(token.expires_in, Duration::from_secs(3600));
+        assert!(!token.token_type_missing);
     }
 
     #[test]
     fn test_parse_token_response_missing_expires_defaults() {
         let json = r#"{"access_token":"tok_abc","token_type":"Bearer"}"#;
-        let (token, expires) = parse_token_response(json).unwrap();
-        assert_eq!(token.as_str(), "tok_abc");
-        assert_eq!(expires, Duration::from_secs(DEFAULT_EXPIRES_IN_SECS));
+        let token = parse_token_response(json).unwrap();
+        assert_eq!(token.access_token.as_str(), "tok_abc");
+        assert_eq!(
+            token.expires_in,
+            Duration::from_secs(DEFAULT_EXPIRES_IN_SECS)
+        );
     }
 
     #[test]
@@ -940,9 +1071,7 @@ mod tests {
 
     /// Exercise the real exchange against a loopback server using only fake
     /// credentials. Consume the request before responding, without logging it.
-    async fn exchange_mock_token_response(
-        response: String,
-    ) -> Result<(Zeroizing<String>, Duration)> {
+    async fn exchange_mock_token_response(response: String) -> Result<TokenResponse> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -981,6 +1110,107 @@ mod tests {
         .unwrap();
         server.await.unwrap();
         result
+    }
+
+    #[tokio::test]
+    async fn test_exchange_token_rejects_non_bearer_token_type() {
+        let json = r#"{"access_token":"dpop-bound-token","token_type":"DPoP","expires_in":3600}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+            json.len(),
+            json
+        );
+        let err = exchange_mock_token_response(response)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(r#"token_type "DPoP""#), "{err}");
+        assert!(!err.contains("dpop-bound-token"), "token leaked: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_token_cache_new_fails_on_non_bearer_token_type() {
+        let (token_url, server) =
+            serve_token_response_once(r#"{"access_token":"na-token","token_type":"N_A"}"#).await;
+        let config = OAuth2ExchangeConfig {
+            token_url,
+            client_id: Zeroizing::new("test-client".to_string()),
+            client_secret: Zeroizing::new("test-secret".to_string()),
+            scope: String::new(),
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            TokenCache::new(config, make_test_tls_connector()),
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains(r#"token_type "N_A""#), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_refresh_with_non_bearer_token_type_keeps_stale_token() {
+        let (token_url, server) =
+            serve_token_response_once(r#"{"access_token":"na-token","token_type":"N_A"}"#).await;
+        let config = OAuth2ExchangeConfig {
+            token_url,
+            client_id: Zeroizing::new("test-client".to_string()),
+            client_secret: Zeroizing::new("test-secret".to_string()),
+            scope: String::new(),
+        };
+        // Already expired, so the next use refreshes.
+        let cache = TokenCache::new_from_parts(
+            config,
+            make_test_tls_connector(),
+            "stale-bearer-token",
+            Duration::from_secs(0),
+        );
+        let token = tokio::time::timeout(Duration::from_secs(5), cache.get_or_refresh())
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(token.as_str(), "stale-bearer-token");
+    }
+
+    /// Accept one token request on a loopback listener, drain it, and reply
+    /// `200 OK` with `json`. Returns the token URL and the server task.
+    async fn serve_token_response_once(
+        json: &'static str,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).await.unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = v.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0; content_length];
+            reader.read_exact(&mut body).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                json.len(),
+                json
+            );
+            reader
+                .get_mut()
+                .write_all(response.as_bytes())
+                .await
+                .unwrap();
+            reader.get_mut().shutdown().await.unwrap();
+        });
+        (format!("http://{addr}/oauth/token"), server)
     }
 
     #[tokio::test]

@@ -101,7 +101,8 @@ or workspace identifiers) can be passed via `auth.extra_params`:
 
 The difference between this and the `spiffe.type: jwt` block is the intermediary step: here nono
 exchanges the JWT-SVID for an OAuth2 token and caches it until near expiry; with `spiffe.type: jwt`
-the raw JWT-SVID is injected directly with no exchange.
+the raw JWT-SVID is injected directly with no exchange. As with `client_id`/`client_secret` routes,
+the token endpoint must issue a Bearer token; any other `token_type` fails the exchange.
 
 ---
 

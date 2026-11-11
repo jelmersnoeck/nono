@@ -1507,6 +1507,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_load_oauth2_non_bearer_token_type_skips_route() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Loopback token endpoint that issues a token nono cannot inject.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 1024];
+            // The fake request is tiny; read until the form body arrives.
+            while !String::from_utf8_lossy(&request).contains("grant_type=") {
+                let n = stream.read(&mut buf).await.unwrap();
+                assert!(n > 0, "client closed before sending the token request");
+                request.extend_from_slice(&buf[..n]);
+            }
+            let json = r#"{"access_token":"greendale-na-token","token_type":"N_A"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{json}",
+                json.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let id_path = dir.path().join("client_id");
+        let secret_path = dir.path().join("client_secret");
+        std::fs::write(&id_path, "troy-barnes").unwrap();
+        std::fs::write(&secret_path, "abed-nadir").unwrap();
+        let routes = vec![oauth2_route_with_refs(
+            "human-being-api",
+            &format!("file://{}", id_path.display()),
+            &format!("file://{}", secret_path.display()),
+            &format!("http://{addr}/oauth/token"),
+        )];
+
+        let outcome = CredentialStore::load_with_diagnostics(&routes, &test_tls_connector(), None)
+            .await
+            .expect("a rejected token_type skips the route, it does not fail the load");
+        server.await.unwrap();
+
+        assert!(outcome.store.get_oauth2("human-being-api").is_none());
+        assert_eq!(outcome.diagnostics.len(), 1);
+        let diagnostic = &outcome.diagnostics[0];
+        assert_eq!(
+            diagnostic.code,
+            ProxyDiagnosticCode::OAuthTokenExchangeFailed
+        );
+        assert!(
+            diagnostic.message.contains(r#"token_type "N_A""#),
+            "{}",
+            diagnostic.message
+        );
+        assert!(!diagnostic.message.contains("greendale-na-token"));
+    }
+
+    #[tokio::test]
     async fn test_load_oauth2_unreachable_endpoint_skips_route() {
         use crate::config::OAuth2Config;
 
