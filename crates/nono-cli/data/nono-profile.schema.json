@@ -1424,6 +1424,11 @@
           "additionalProperties": { "type": "string" },
           "description": "Extra parameters merged into the token exchange POST body verbatim.",
           "default": {}
+        },
+        "resource": {
+          "type": "string",
+          "minLength": 1,
+          "description": "RFC 8707 resource indicator sent as `resource` in the token request. Omit to send no resource parameter. Set to \"upstream\" to send the route's upstream URL exactly as configured, or to an absolute URI or URN (e.g., \"urn:example:api\") to send that value as written. Must not contain a fragment, query, whitespace, or control characters. Cannot be combined with extra_params.resource."
         }
       }
     },

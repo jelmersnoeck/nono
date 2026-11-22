@@ -439,6 +439,15 @@ impl CredentialStore {
 
             // OAuth2 path
             if let Some(ref oauth2) = route.oauth2 {
+                // RouteStore::load already rejects an invalid resource; check
+                // again so this loader never sends an unvalidated value.
+                let resource = match crate::config::resolve_oauth2_resource(oauth2, &route.upstream)
+                {
+                    Ok(resource) => resource.map(str::to_string),
+                    Err(e) => {
+                        return Err(ProxyError::Config(format!("route '{}': {e}", route.prefix)));
+                    }
+                };
                 if let Some(ref assertion) = oauth2.client_assertion {
                     // jwt-bearer grant via SPIFFE JWT-SVID
                     use crate::config::ClientAssertionConfig;
@@ -491,6 +500,7 @@ impl CredentialStore {
                             oauth2.token_url.clone(),
                             jwt_source,
                             audience.clone(),
+                            resource,
                             extra_params,
                             tls_connector.clone(),
                         ))
@@ -569,6 +579,7 @@ impl CredentialStore {
                         client_id,
                         client_secret,
                         scope: oauth2.scope.clone(),
+                        resource,
                     };
 
                     match TokenCache::new(config, tls_connector.clone()).await {
@@ -1101,6 +1112,7 @@ mod tests {
                 scope: String::new(),
                 client_assertion: None,
                 extra_params: Default::default(),
+                resource: None,
             }),
             aws_auth: None,
             spiffe: None,
@@ -1546,6 +1558,7 @@ mod tests {
                 scope: String::new(),
                 client_assertion: None,
                 extra_params: Default::default(),
+                resource: None,
             }),
             aws_auth: None,
             spiffe: None,
@@ -1726,6 +1739,7 @@ mod tests {
             client_id: Zeroizing::new("test-client".to_string()),
             client_secret: Zeroizing::new("test-secret".to_string()),
             scope: String::new(),
+            resource: None,
         };
 
         TokenCache::new_from_parts(config, test_tls_connector(), token, ttl)

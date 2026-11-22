@@ -52,6 +52,9 @@ pub struct OAuth2ExchangeConfig {
     pub client_id: Zeroizing<String>,
     pub client_secret: Zeroizing<String>,
     pub scope: String,
+    /// RFC 8707 resource indicator, already validated and resolved by
+    /// [`crate::config::resolve_oauth2_resource`]. `None` omits the parameter.
+    pub resource: Option<String>,
 }
 
 /// Custom Debug that redacts secrets.
@@ -62,6 +65,7 @@ impl std::fmt::Debug for OAuth2ExchangeConfig {
             .field("client_id", &"[REDACTED]")
             .field("client_secret", &"[REDACTED]")
             .field("scope", &self.scope)
+            .field("resource", &self.resource)
             .finish()
     }
 }
@@ -293,7 +297,12 @@ async fn exchange_token(
     let path_with_query = token_request_target(&parsed);
 
     // ── Build form body ──────────────────────────────────────────────────
-    let body = build_token_request_body(&config.client_id, &config.client_secret, &config.scope);
+    let body = build_token_request_body(
+        &config.client_id,
+        &config.client_secret,
+        &config.scope,
+        config.resource.as_deref(),
+    );
 
     // ── Build HTTP/1.1 request ───────────────────────────────────────────
     let request = Zeroizing::new(format!(
@@ -370,28 +379,21 @@ async fn exchange_token(
             )
         })?;
 
-    // Check status code
-    let status_line = response_str.lines().next().unwrap_or("");
-    let status_code = parse_status_code(status_line);
-    if !(200..300).contains(&status_code) {
-        let body_preview: String = response_str[body_start..].chars().take(200).collect();
-        return Err(ProxyError::OAuth2Exchange(format!(
-            "token endpoint returned HTTP {}: {}",
-            status_code, body_preview
-        )));
-    }
-
+    let status_code = parse_status_code(response_str.lines().next().unwrap_or(""));
     let raw_body = &response_str[body_start..];
     let is_chunked = response_str[..body_start].lines().any(|line| {
         line.to_ascii_lowercase()
             .contains("transfer-encoding: chunked")
     });
-    if is_chunked {
-        let json_body = Zeroizing::new(decode_chunked(raw_body));
-        parse_token_response(&json_body)
+    let body = if is_chunked {
+        Zeroizing::new(decode_chunked(raw_body))
     } else {
-        parse_token_response(raw_body)
+        Zeroizing::new(raw_body.to_string())
+    };
+    if !(200..300).contains(&status_code) {
+        return Err(token_endpoint_error(status_code, &body));
     }
+    parse_token_response(&body)
 }
 
 /// Read a full HTTP response from a stream up to [`MAX_TOKEN_RESPONSE`] bytes.
@@ -430,11 +432,12 @@ fn parse_status_code(line: &str) -> u16 {
 
 /// Build the `application/x-www-form-urlencoded` body for the token request.
 ///
-/// The `scope` parameter is omitted when empty.
+/// The `scope` parameter is omitted when empty, and `resource` when `None`.
 fn build_token_request_body(
     client_id: &str,
     client_secret: &str,
     scope: &str,
+    resource: Option<&str>,
 ) -> Zeroizing<String> {
     let mut body = Zeroizing::new(format!(
         "grant_type=client_credentials&client_id={}&client_secret={}",
@@ -444,7 +447,87 @@ fn build_token_request_body(
     if !scope.is_empty() {
         body.push_str(&format!("&scope={}", urlencoding::encode(scope)));
     }
+    push_resource(&mut body, resource);
     body
+}
+
+/// Build the form body for a `jwt-bearer` client assertion token request.
+fn build_jwt_assertion_body(
+    assertion: &str,
+    resource: Option<&str>,
+    extra_params: &[(String, String)],
+) -> Zeroizing<String> {
+    let mut body = Zeroizing::new(format!(
+        "grant_type={}&client_assertion_type={}&assertion={}",
+        urlencoding::encode("urn:ietf:params:oauth:grant-type:jwt-bearer"),
+        urlencoding::encode("urn:ietf:params:oauth:client-assertion-type:jwt-bearer"),
+        urlencoding::encode(assertion),
+    ));
+    push_resource(&mut body, resource);
+    for (k, v) in extra_params {
+        body.push_str(&format!(
+            "&{}={}",
+            urlencoding::encode(k),
+            urlencoding::encode(v)
+        ));
+    }
+    body
+}
+
+/// Append the RFC 8707 `resource` parameter, percent-encoded, when set.
+fn push_resource(body: &mut String, resource: Option<&str>) {
+    if let Some(resource) = resource {
+        body.push_str(&format!("&resource={}", urlencoding::encode(resource)));
+    }
+}
+
+/// Longest server-supplied text echoed into a token endpoint diagnostic.
+const MAX_ERROR_PREVIEW: usize = 200;
+
+/// Describe a non-2xx token endpoint response.
+///
+/// For an RFC 6749 §5.2 error body only `error` and `error_description` are
+/// shown, never the rest of the body. `invalid_target` (RFC 8707 §2) gets a
+/// hint pointing at `auth.resource`.
+fn token_endpoint_error(status: u16, body: &str) -> ProxyError {
+    let parsed: Option<serde_json::Value> = serde_json::from_str(body).ok();
+    let Some(error) = parsed
+        .as_ref()
+        .and_then(|v| v.get("error"))
+        .and_then(|v| v.as_str())
+    else {
+        let preview: String = body.chars().take(MAX_ERROR_PREVIEW).collect();
+        return ProxyError::OAuth2Exchange(format!(
+            "token endpoint returned HTTP {status}: {preview}"
+        ));
+    };
+    let mut message = format!(
+        "token endpoint returned HTTP {status}: {}",
+        sanitize_error_field(error)
+    );
+    if let Some(description) = parsed
+        .as_ref()
+        .and_then(|v| v.get("error_description"))
+        .and_then(|v| v.as_str())
+    {
+        message.push_str(&format!(" ({})", sanitize_error_field(description)));
+    }
+    if error == "invalid_target" {
+        message.push_str(
+            "; the token endpoint rejected the RFC 8707 resource indicator. \
+             Check auth.resource, or remove it if this endpoint does not support it",
+        );
+    }
+    ProxyError::OAuth2Exchange(message)
+}
+
+/// Drop control characters and cap length so server text cannot forge log lines.
+fn sanitize_error_field(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_ERROR_PREVIEW)
+        .collect()
 }
 
 /// Parse a standard OAuth2 token response JSON.
@@ -486,6 +569,7 @@ pub struct SpiffeAssertionTokenCache {
     jwt_source: Arc<crate::spiffe::SpiffeJwtSource>,
     token_url: String,
     assertion_audience: Vec<String>,
+    resource: Option<String>,
     extra_params: Vec<(String, String)>,
     tls_connector: TlsConnector,
     pub workload_spiffe_id: String,
@@ -505,6 +589,7 @@ impl SpiffeAssertionTokenCache {
         token_url: String,
         jwt_source: Arc<crate::spiffe::SpiffeJwtSource>,
         assertion_audience: Vec<String>,
+        resource: Option<String>,
         extra_params: Vec<(String, String)>,
         tls_connector: TlsConnector,
     ) -> Result<Self> {
@@ -512,6 +597,7 @@ impl SpiffeAssertionTokenCache {
             &token_url,
             &jwt_source,
             &assertion_audience,
+            resource.as_deref(),
             &extra_params,
             &tls_connector,
         )
@@ -525,6 +611,7 @@ impl SpiffeAssertionTokenCache {
             jwt_source,
             token_url,
             assertion_audience,
+            resource,
             extra_params,
             tls_connector,
             workload_spiffe_id,
@@ -566,6 +653,7 @@ impl SpiffeAssertionTokenCache {
             &self.token_url,
             &self.jwt_source,
             &self.assertion_audience,
+            self.resource.as_deref(),
             &self.extra_params,
             &self.tls_connector,
         )
@@ -601,24 +689,12 @@ async fn exchange_jwt_assertion(
     token_url: &str,
     jwt_source: &crate::spiffe::SpiffeJwtSource,
     audience: &[String],
+    resource: Option<&str>,
     extra_params: &[(String, String)],
     tls_connector: &TlsConnector,
 ) -> Result<(Zeroizing<String>, Duration, String)> {
     let (assertion, spiffe_id) = jwt_source.fetch_token(audience).await?;
-
-    let mut body = Zeroizing::new(format!(
-        "grant_type={}&client_assertion_type={}&assertion={}",
-        urlencoding::encode("urn:ietf:params:oauth:grant-type:jwt-bearer"),
-        urlencoding::encode("urn:ietf:params:oauth:client-assertion-type:jwt-bearer"),
-        urlencoding::encode(assertion.as_str()),
-    ));
-    for (k, v) in extra_params {
-        body.push_str(&format!(
-            "&{}={}",
-            urlencoding::encode(k),
-            urlencoding::encode(v)
-        ));
-    }
+    let body = build_jwt_assertion_body(assertion.as_str(), resource, extra_params);
 
     let parsed = url::Url::parse(token_url)
         .map_err(|e| ProxyError::OAuth2Exchange(format!("invalid token_url '{token_url}': {e}")))?;
@@ -721,10 +797,7 @@ async fn exchange_jwt_assertion(
         raw_body.to_string()
     };
     if !(200..300).contains(&status) {
-        let preview: String = body.chars().take(200).collect();
-        return Err(ProxyError::OAuth2Exchange(format!(
-            "token endpoint returned HTTP {status}: {preview}"
-        )));
+        return Err(token_endpoint_error(status, &body));
     }
     let (token, expires) = parse_token_response(&body)?;
     Ok((token, expires, spiffe_id))
@@ -862,7 +935,7 @@ mod tests {
 
     #[test]
     fn test_build_token_request_body() {
-        let body = build_token_request_body("my-client", "s3cret!", "read write");
+        let body = build_token_request_body("my-client", "s3cret!", "read write", None);
         assert!(body.contains("grant_type=client_credentials"));
         assert!(body.contains("client_id=my-client"));
         assert!(body.contains("client_secret=s3cret%21"));
@@ -870,8 +943,171 @@ mod tests {
     }
 
     #[test]
+    fn test_build_token_request_body_without_resource_is_unchanged() {
+        let cases: &[(&str, &str)] = &[
+            (
+                "",
+                "grant_type=client_credentials&client_id=cid&client_secret=csec",
+            ),
+            (
+                "read write",
+                "grant_type=client_credentials&client_id=cid&client_secret=csec&scope=read%20write",
+            ),
+        ];
+        for (scope, want) in cases {
+            let body = build_token_request_body("cid", "csec", scope, None);
+            assert_eq!(body.as_str(), *want);
+        }
+    }
+
+    #[test]
+    fn test_build_token_request_body_with_resource() {
+        let cases: &[(&str, &str)] = &[
+            (
+                "https://api.greendale.example",
+                "&resource=https%3A%2F%2Fapi.greendale.example",
+            ),
+            (
+                "urn:greendale:human-being-api",
+                "&resource=urn%3Agreendale%3Ahuman-being-api",
+            ),
+        ];
+        for (resource, want_suffix) in cases {
+            let body = build_token_request_body("cid", "csec", "read", Some(resource));
+            assert_eq!(
+                body.as_str(),
+                format!(
+                    "grant_type=client_credentials&client_id=cid&client_secret=csec\
+                     &scope=read{want_suffix}"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_jwt_assertion_body() {
+        let extra = vec![("audience".to_string(), "greendale".to_string())];
+        let prefix = "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer\
+                      &client_assertion_type=urn%3Aietf%3Aparams%3Aoauth%3Aclient-assertion-type%3Ajwt-bearer\
+                      &assertion=a.b.c";
+        let cases: &[(Option<&str>, String)] = &[
+            (None, format!("{prefix}&audience=greendale")),
+            (
+                Some("urn:greendale:human-being-api"),
+                format!("{prefix}&resource=urn%3Agreendale%3Ahuman-being-api&audience=greendale"),
+            ),
+        ];
+        for (resource, want) in cases {
+            let body = build_jwt_assertion_body("a.b.c", *resource, &extra);
+            assert_eq!(body.as_str(), want);
+        }
+    }
+
+    // ── token_endpoint_error ─────────────────────────────────────────────
+
+    #[test]
+    fn test_token_endpoint_error_invalid_target_hint() {
+        let body = r#"{"error":"invalid_target","error_description":"unknown resource","echo":"client_secret=csec"}"#;
+        let msg = token_endpoint_error(400, body).to_string();
+        assert!(
+            msg.contains("HTTP 400: invalid_target (unknown resource)"),
+            "{msg}"
+        );
+        assert!(msg.contains("auth.resource"), "{msg}");
+        assert!(!msg.contains("csec"), "only error fields are shown: {msg}");
+    }
+
+    #[test]
+    fn test_token_endpoint_error_oauth_error_without_hint() {
+        let msg = token_endpoint_error(401, r#"{"error":"invalid_client"}"#).to_string();
+        assert!(msg.ends_with("HTTP 401: invalid_client"), "{msg}");
+        assert!(!msg.contains("auth.resource"), "{msg}");
+    }
+
+    #[test]
+    fn test_token_endpoint_error_strips_control_characters() {
+        let body = r#"{"error":"invalid_target","error_description":"bad\nFAKE LOG LINE"}"#;
+        let msg = token_endpoint_error(400, body).to_string();
+        assert!(!msg.contains('\n'), "{msg}");
+        assert!(msg.contains("badFAKE LOG LINE"), "{msg}");
+    }
+
+    #[test]
+    fn test_token_endpoint_error_non_json_falls_back_to_preview() {
+        let msg = token_endpoint_error(502, "Bad Gateway").to_string();
+        assert!(msg.ends_with("HTTP 502: Bad Gateway"), "{msg}");
+    }
+
+    // ── resource indicator against a loopback token endpoint ────────────
+
+    #[tokio::test]
+    async fn test_token_cache_sends_resource_on_initial_and_refresh() {
+        // expires_in 0 makes every get_or_refresh() do a fresh exchange.
+        let (addr, server) = spawn_token_server(2, r#"{"access_token":"tok","expires_in":0}"#);
+        let config = OAuth2ExchangeConfig {
+            token_url: format!("http://{addr}/oauth/2/token"),
+            client_id: Zeroizing::new("troy-barnes".to_string()),
+            client_secret: Zeroizing::new("test-secret".to_string()),
+            scope: String::new(),
+            resource: Some("urn:greendale:human-being-api".to_string()),
+        };
+        let cache = TokenCache::new(config, make_test_tls_connector())
+            .await
+            .unwrap();
+        cache.get_or_refresh().await;
+        let bodies = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+        let want = "grant_type=client_credentials&client_id=troy-barnes&client_secret=test-secret\
+                    &resource=urn%3Agreendale%3Ahuman-being-api";
+        assert_eq!(bodies, vec![want.to_string(), want.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_exchange_token_reports_invalid_target() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            read_request_body(&mut reader).await;
+            let json = r#"{"error":"invalid_target","error_description":"no such resource"}"#;
+            let response = format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{json}",
+                json.len()
+            );
+            reader
+                .get_mut()
+                .write_all(response.as_bytes())
+                .await
+                .unwrap();
+            reader.get_mut().shutdown().await.unwrap();
+        });
+        let config = OAuth2ExchangeConfig {
+            token_url: format!("http://{addr}/oauth/2/token"),
+            client_id: Zeroizing::new("troy-barnes".to_string()),
+            client_secret: Zeroizing::new("test-secret".to_string()),
+            scope: String::new(),
+            resource: Some("urn:greendale:missing".to_string()),
+        };
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            exchange_token(&config, &make_test_tls_connector()),
+        )
+        .await
+        .unwrap()
+        .unwrap_err()
+        .to_string();
+        server.await.unwrap();
+        assert!(err.contains("invalid_target (no such resource)"), "{err}");
+        assert!(err.contains("auth.resource"), "{err}");
+    }
+
+    #[test]
     fn test_build_token_request_body_no_scope() {
-        let body = build_token_request_body("cid", "csec", "");
+        let body = build_token_request_body("cid", "csec", "", None);
         assert!(body.contains("grant_type=client_credentials"));
         assert!(body.contains("client_id=cid"));
         assert!(body.contains("client_secret=csec"));
@@ -938,6 +1174,57 @@ mod tests {
 
     // ── Helpers ──────────────────────────────────────────────────────────
 
+    /// Read one HTTP request's headers and body; return the body.
+    async fn read_request_body(reader: &mut BufReader<tokio::net::TcpStream>) -> String {
+        let mut content_length = 0usize;
+        loop {
+            let mut line = String::new();
+            assert!(reader.read_line(&mut line).await.unwrap() > 0);
+            if line == "\r\n" {
+                break;
+            }
+            if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                content_length = v.trim().parse().unwrap();
+            }
+        }
+        let mut body = vec![0; content_length];
+        reader.read_exact(&mut body).await.unwrap();
+        String::from_utf8(body).unwrap()
+    }
+
+    /// Loopback token endpoint that answers `count` requests with `json` and
+    /// returns the request bodies it received.
+    fn spawn_token_server(
+        count: usize,
+        json: &'static str,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            let mut bodies = Vec::with_capacity(count);
+            for _ in 0..count {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(stream);
+                bodies.push(read_request_body(&mut reader).await);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{json}",
+                    json.len()
+                );
+                reader
+                    .get_mut()
+                    .write_all(response.as_bytes())
+                    .await
+                    .unwrap();
+                reader.get_mut().shutdown().await.unwrap();
+            }
+            bodies
+        });
+        (addr, server)
+    }
+
     /// Exercise the real exchange against a loopback server using only fake
     /// credentials. Consume the request before responding, without logging it.
     async fn exchange_mock_token_response(
@@ -972,6 +1259,7 @@ mod tests {
             client_id: Zeroizing::new("test-client".to_string()),
             client_secret: Zeroizing::new("test-secret".to_string()),
             scope: String::new(),
+            resource: None,
         };
         let result = tokio::time::timeout(
             Duration::from_secs(5),
@@ -1022,6 +1310,7 @@ mod tests {
             client_id: Zeroizing::new("test-client".to_string()),
             client_secret: Zeroizing::new("test-secret".to_string()),
             scope: String::new(),
+            resource: None,
         };
         let registry = SecretRegistry::new();
         // Already expired, so the next use refreshes.
@@ -1064,6 +1353,7 @@ mod tests {
             client_id: Zeroizing::new("test-client".to_string()),
             client_secret: Zeroizing::new("test-secret".to_string()),
             scope: String::new(),
+            resource: None,
         };
 
         TokenCache::new_from_parts(config, make_test_tls_connector(), token, ttl)

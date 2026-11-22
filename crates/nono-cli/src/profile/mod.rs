@@ -724,7 +724,7 @@ fn validate_custom_credential(name: &str, cred: &CustomCredentialDef) -> Result<
 
     // Validate OAuth2 auth if present
     if let Some(ref auth) = cred.auth {
-        validate_oauth2_auth(name, auth)?;
+        validate_oauth2_auth(name, &cred.upstream, auth)?;
     }
 
     // Validate aws_auth if present
@@ -943,9 +943,13 @@ fn validate_proxy_override(name: &str, cred: &CustomCredentialDef) -> Result<()>
 /// - `client_id` must not be empty
 /// - `client_secret` must not be empty and must be a credential reference
 ///   (env://, file://, op://, bw://, apple-password://) or plain value
-fn validate_oauth2_auth(name: &str, auth: &OAuth2Config) -> Result<()> {
+/// - `resource`, when set, must resolve to a valid RFC 8707 resource indicator
+fn validate_oauth2_auth(name: &str, upstream: &str, auth: &OAuth2Config) -> Result<()> {
     // Validate token_url — same rules as upstream URL (HTTPS or loopback HTTP)
     validate_upstream_url(&auth.token_url, &format!("{}/auth.token_url", name))?;
+
+    nono_proxy::config::resolve_oauth2_resource(auth, upstream)
+        .map_err(|e| NonoError::ProfileParse(format!("custom credential '{}': {}", name, e)))?;
 
     // When using client_assertion, client_id/client_secret are not required,
     // but the assertion config itself must have valid fields.
@@ -7205,6 +7209,7 @@ mod tests {
                 scope: "read write".to_string(),
                 client_assertion: None,
                 extra_params: Default::default(),
+                resource: None,
             }),
             inject_mode: InjectMode::Header,
             inject_header: "Authorization".to_string(),
@@ -7230,6 +7235,74 @@ mod tests {
     fn test_validate_oauth2_auth_valid() {
         let cred = oauth2_cred_builder();
         assert!(validate_custom_credential("test", &cred).is_ok());
+    }
+
+    fn oauth2_cred_with_resource(upstream: &str, resource: &str) -> CustomCredentialDef {
+        let mut cred = oauth2_cred_builder();
+        cred.upstream = upstream.to_string();
+        if let Some(auth) = cred.auth.as_mut() {
+            auth.resource = Some(resource.to_string());
+        }
+        cred
+    }
+
+    #[test]
+    fn test_validate_oauth2_resource_valid() {
+        for resource in [
+            "upstream",
+            "https://api.greendale.example",
+            "urn:greendale:human-being-api",
+        ] {
+            let cred = oauth2_cred_with_resource("https://api.greendale.example", resource);
+            assert!(
+                validate_custom_credential("human_being_api", &cred).is_ok(),
+                "{resource}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_oauth2_resource_invalid() {
+        let cases = [
+            ("https://api.greendale.example", "", "must not be empty"),
+            (
+                "https://api.greendale.example",
+                "urn:greendale:x\r\nX: y",
+                "control",
+            ),
+            ("https://api.greendale.example", "/v1", "absolute URI"),
+            (
+                "https://api.greendale.example",
+                "https://api.greendale.example/#study-group",
+                "fragment",
+            ),
+            (
+                "https://api.greendale.example/?campus=1",
+                "upstream",
+                "query",
+            ),
+        ];
+        for (upstream, resource, want) in cases {
+            let cred = oauth2_cred_with_resource(upstream, resource);
+            let err = validate_custom_credential("human_being_api", &cred)
+                .expect_err(resource)
+                .to_string();
+            assert!(err.contains("human_being_api"), "{err}");
+            assert!(err.contains(want), "{resource:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn test_validate_oauth2_resource_conflicts_with_extra_params() {
+        let mut cred = oauth2_cred_with_resource("https://api.greendale.example", "upstream");
+        if let Some(auth) = cred.auth.as_mut() {
+            auth.extra_params
+                .insert("resource".to_string(), "urn:greendale:other".to_string());
+        }
+        let err = validate_custom_credential("human_being_api", &cred)
+            .expect_err("conflict")
+            .to_string();
+        assert!(err.contains("mutually exclusive"), "{err}");
     }
 
     #[test]
@@ -7261,6 +7334,7 @@ mod tests {
             scope: String::new(),
             client_assertion: None,
             extra_params: Default::default(),
+            resource: None,
         });
         let result = validate_custom_credential("test", &cred);
         let err = result.expect_err("HTTP to remote token_url should be rejected");
@@ -7277,6 +7351,7 @@ mod tests {
             scope: String::new(),
             client_assertion: None,
             extra_params: Default::default(),
+            resource: None,
         });
         assert!(validate_custom_credential("test", &cred).is_ok());
     }
@@ -7291,6 +7366,7 @@ mod tests {
             scope: String::new(),
             client_assertion: None,
             extra_params: Default::default(),
+            resource: None,
         });
         let result = validate_custom_credential("test", &cred);
         let err = result.expect_err("empty client_id should be rejected");
@@ -7308,6 +7384,7 @@ mod tests {
             scope: String::new(),
             client_assertion: None,
             extra_params: Default::default(),
+            resource: None,
         });
         let result = validate_custom_credential("test", &cred);
         let err = result.expect_err("empty client_secret should be rejected");
@@ -7329,6 +7406,7 @@ mod tests {
                 svid_hint: None,
             }),
             extra_params: Default::default(),
+            resource: None,
         });
         assert!(validate_custom_credential("test", &cred).is_ok());
     }
@@ -7347,6 +7425,7 @@ mod tests {
                 svid_hint: None,
             }),
             extra_params: Default::default(),
+            resource: None,
         });
         let result = validate_custom_credential("test", &cred);
         let err = result.expect_err("client_id with client_assertion should be rejected");
@@ -7367,6 +7446,7 @@ mod tests {
                 svid_hint: None,
             }),
             extra_params: Default::default(),
+            resource: None,
         });
         let result = validate_custom_credential("test", &cred);
         let err = result.expect_err("client_secret with client_assertion should be rejected");
@@ -7383,6 +7463,7 @@ mod tests {
             scope: String::new(),
             client_assertion: None,
             extra_params: Default::default(),
+            resource: None,
         });
         assert!(validate_custom_credential("test", &cred).is_ok());
     }
@@ -12525,6 +12606,7 @@ mod tests {
                 scope: String::new(),
                 client_assertion: None,
                 extra_params: Default::default(),
+                resource: None,
             }),
             ..aws_auth_cred_builder()
         };

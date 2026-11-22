@@ -1299,6 +1299,7 @@ mod tests {
                     scope: "api.read".to_string(),
                     client_assertion: None,
                     extra_params: Default::default(),
+                    resource: None,
                 }),
                 inject_mode: InjectMode::Header,
                 inject_header: "Authorization".to_string(),

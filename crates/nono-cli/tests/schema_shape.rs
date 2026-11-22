@@ -225,6 +225,7 @@ fn test_schema_oauth2_config_matches_rust_model() {
             "scope",
             "client_assertion",
             "extra_params",
+            "resource",
         ],
     );
     assert_properties_at(

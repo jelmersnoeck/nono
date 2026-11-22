@@ -2799,6 +2799,157 @@ mod tests {
         handle.shutdown();
     }
 
+    /// Mock OAuth2 token endpoint that records each request body and answers
+    /// with a fixed access token.
+    async fn spawn_recording_token_endpoint(
+        access_token: &'static str,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let bodies_handle = std::sync::Arc::clone(&bodies);
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                // The token request is small; one read holds head and body.
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                let body = request
+                    .split_once("\r\n\r\n")
+                    .map(|(_, b)| b.to_string())
+                    .unwrap_or_default();
+                bodies_handle.lock().unwrap().push(body);
+                let json = format!(r#"{{"access_token":"{access_token}","expires_in":3600}}"#);
+                let _ = sock
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n{json}",
+                            json.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+            }
+        });
+        (
+            format!("http://127.0.0.1:{}/oauth/2/token", addr.port()),
+            bodies,
+        )
+    }
+
+    fn oauth2_resource_route(
+        upstream: &str,
+        token_url: &str,
+        dir: &std::path::Path,
+        resource: Option<&str>,
+    ) -> crate::config::RouteConfig {
+        let id_path = dir.join("client_id");
+        let secret_path = dir.join("client_secret");
+        std::fs::write(&id_path, "human-being-mascot").unwrap();
+        std::fs::write(&secret_path, "streets-ahead").unwrap();
+        let mut route = declarative_route(upstream);
+        route.credential_format = Some("Bearer {}".to_string());
+        route.oauth2 = Some(crate::config::OAuth2Config {
+            token_url: token_url.to_string(),
+            client_id: format!("file://{}", id_path.display()),
+            client_secret: format!("file://{}", secret_path.display()),
+            scope: String::new(),
+            client_assertion: None,
+            extra_params: Default::default(),
+            resource: resource.map(str::to_string),
+        });
+        route
+    }
+
+    /// End to end: the token request carries the RFC 8707 resource, and the
+    /// resource-scoped token is what reaches the upstream.
+    #[tokio::test]
+    async fn test_oauth2_resource_reverse_route_end_to_end() {
+        let cases: &[(Option<&str>, Option<&str>)] = &[
+            (None, None),
+            (Some("upstream"), Some("upstream")),
+            (
+                Some("urn:greendale:human-being-api"),
+                Some("urn%3Agreendale%3Ahuman-being-api"),
+            ),
+        ];
+        for (resource, want_resource) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let (upstream, heads) = spawn_recording_upstream().await;
+            let upstream_url = format!("http://{upstream}");
+            let (token_url, bodies) = spawn_recording_token_endpoint("kc-scoped-token").await;
+            let token = "f".repeat(64);
+            let config = ProxyConfig {
+                routes: vec![oauth2_resource_route(
+                    &upstream_url,
+                    &token_url,
+                    dir.path(),
+                    *resource,
+                )],
+                allowed_hosts: vec!["127.0.0.1".to_string()],
+                session_token: Some(Zeroizing::new(token.clone())),
+                ..Default::default()
+            };
+            let handle = start(config).await.unwrap();
+
+            let base = "grant_type=client_credentials&client_id=human-being-mascot\
+                        &client_secret=streets-ahead";
+            let want_body = match want_resource {
+                None => base.to_string(),
+                Some("upstream") => {
+                    format!("{base}&resource={}", urlencoding::encode(&upstream_url))
+                }
+                Some(encoded) => format!("{base}&resource={encoded}"),
+            };
+            assert_eq!(*bodies.lock().unwrap(), vec![want_body], "{resource:?}");
+
+            let request = format!(
+                "GET /svc/x HTTP/1.1\r\nHost: h\r\nAuthorization: Bearer {token}\r\n\
+                 Connection: close\r\n\r\n"
+            );
+            let resp = send_raw_request(handle.port, request.as_bytes()).await;
+            assert!(resp.starts_with("HTTP/1.1 200"), "{resource:?}: {resp:?}");
+            let seen = heads.lock().unwrap().clone();
+            assert_eq!(seen.len(), 1, "{resource:?}");
+            assert!(seen[0].contains("Bearer kc-scoped-token"), "{}", seen[0]);
+            assert!(!seen[0].contains(&token), "phantom must not be forwarded");
+            handle.shutdown();
+        }
+    }
+
+    /// An invalid resource fails proxy startup before any token request.
+    #[tokio::test]
+    async fn test_oauth2_invalid_resource_fails_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let (token_url, bodies) = spawn_recording_token_endpoint("never-issued").await;
+        let cases: &[(&str, &str)] = &[
+            (
+                "http://127.0.0.1:1",
+                "https://api.greendale.example/#fragment",
+            ),
+            ("http://127.0.0.1:1/?q=1", "upstream"),
+            ("http://127.0.0.1:1", "relative/path"),
+        ];
+        for (upstream, resource) in cases {
+            let config = ProxyConfig {
+                routes: vec![oauth2_resource_route(
+                    upstream,
+                    &token_url,
+                    dir.path(),
+                    Some(resource),
+                )],
+                ..Default::default()
+            };
+            let err = start(config).await.err().expect("startup should fail");
+            assert!(
+                err.to_string().contains("auth.resource"),
+                "{resource}: {err}"
+            );
+        }
+        assert!(bodies.lock().unwrap().is_empty());
+    }
+
     /// Regression: a route without `phantom_format` keeps requiring the bare token.
     #[tokio::test]
     async fn test_unformatted_reverse_route_still_requires_bare_token() {

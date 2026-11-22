@@ -382,6 +382,12 @@ impl RouteStore {
                 }
             };
 
+            if let Some(ref oauth2) = route.oauth2 {
+                crate::config::resolve_oauth2_resource(oauth2, &route.upstream).map_err(|e| {
+                    ProxyError::Config(format!("route '{}': {}", normalized_prefix, e))
+                })?;
+            }
+
             // A multi-profile route selects its identity from the agent's
             // access key ID; reject maps that could never match, and a
             // `profile` that would otherwise be silently ignored.

@@ -1885,6 +1885,85 @@ pub struct OAuth2Config {
     /// Extra parameters merged into the token exchange POST body verbatim.
     #[serde(default)]
     pub extra_params: std::collections::HashMap<String, String>,
+    /// RFC 8707 resource indicator sent in the token request.
+    ///
+    /// Unset sends no `resource` parameter. An absolute URI (URNs included) is
+    /// sent exactly as written. [`OAUTH2_RESOURCE_UPSTREAM`] sends the route's
+    /// `upstream`. See [`resolve_oauth2_resource`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<String>,
+}
+
+/// `auth.resource` value that sends the route's `upstream` as the resource.
+pub const OAUTH2_RESOURCE_UPSTREAM: &str = "upstream";
+
+/// Validate `auth.resource` and resolve the value sent in the token request.
+///
+/// Shared by every config surface that builds an [`OAuth2Config`] so the rules
+/// cannot drift.
+///
+/// ```text
+///   resource unset          -> None (request body unchanged)
+///   resource = "upstream"   -> Some(upstream), validated like an explicit value
+///   resource = <abs URI>    -> Some(value), sent exactly as configured
+/// ```
+///
+/// A value must be an absolute URI (RFC 3986 §4.3) with no fragment (RFC 8707
+/// §2 MUST) and no query (§2 SHOULD NOT), and must not contain whitespace or
+/// control characters. Setting both `resource` and `extra_params.resource` is
+/// rejected so two different values can never be sent.
+///
+/// # Errors
+///
+/// Returns a message describing why the resource is invalid.
+pub fn resolve_oauth2_resource<'a>(
+    oauth2: &'a OAuth2Config,
+    upstream: &'a str,
+) -> std::result::Result<Option<&'a str>, String> {
+    let Some(resource) = oauth2.resource.as_deref() else {
+        return Ok(None);
+    };
+    if oauth2.extra_params.contains_key("resource") {
+        return Err(
+            "auth.resource and auth.extra_params.resource are mutually exclusive; \
+             set only auth.resource"
+                .to_string(),
+        );
+    }
+    if resource == OAUTH2_RESOURCE_UPSTREAM {
+        validate_resource_uri(upstream)
+            .map_err(|e| format!("auth.resource \"upstream\" resolves to '{upstream}': {e}"))?;
+        return Ok(Some(upstream));
+    }
+    validate_resource_uri(resource).map_err(|e| format!("auth.resource: {e}"))?;
+    Ok(Some(resource))
+}
+
+fn validate_resource_uri(value: &str) -> std::result::Result<(), String> {
+    if value.is_empty() {
+        return Err("must not be empty".to_string());
+    }
+    // Check the raw string: `Url::parse` silently strips tabs and newlines.
+    if value.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err("must not contain whitespace or control characters".to_string());
+    }
+    if value.contains('#') {
+        return Err("must not contain a fragment (RFC 8707 §2)".to_string());
+    }
+    if value.contains('?') {
+        return Err("must not contain a query (RFC 8707 §2)".to_string());
+    }
+    let not_absolute = |detail: String| {
+        format!(
+            "must be an absolute URI such as https://api.example.com or \
+             urn:example:api, or \"{OAUTH2_RESOURCE_UPSTREAM}\": {detail}"
+        )
+    };
+    let parsed = url::Url::parse(value).map_err(|e| not_absolute(e.to_string()))?;
+    if parsed.host().is_none() && parsed.path().is_empty() {
+        return Err(not_absolute("nothing follows the scheme".to_string()));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2945,6 +3024,135 @@ mod tests {
         }"#;
         let config: OAuth2Config = serde_json::from_str(json).unwrap();
         assert_eq!(config.scope, "");
+        assert_eq!(config.resource, None);
+    }
+
+    fn oauth2_with_resource(resource: Option<&str>) -> OAuth2Config {
+        OAuth2Config {
+            token_url: "https://zone.greendale.example/oauth/2/token".to_string(),
+            client_id: "env://KC_CLIENT_ID".to_string(),
+            client_secret: "env://KC_CLIENT_SECRET".to_string(),
+            scope: String::new(),
+            client_assertion: None,
+            extra_params: Default::default(),
+            resource: resource.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn test_oauth2_config_resource_deserialization() {
+        let json = r#"{
+            "token_url": "https://zone.greendale.example/oauth/2/token",
+            "client_id": "env://KC_CLIENT_ID",
+            "client_secret": "env://KC_CLIENT_SECRET",
+            "resource": "urn:greendale:human-being-api"
+        }"#;
+        let config: OAuth2Config = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            config.resource.as_deref(),
+            Some("urn:greendale:human-being-api")
+        );
+    }
+
+    #[test]
+    fn test_resolve_oauth2_resource_valid() {
+        let upstream = "https://api.greendale.example";
+        let cases: &[(&str, Option<&str>, Option<&str>)] = &[
+            ("unset sends nothing", None, None),
+            ("upstream sentinel", Some("upstream"), Some(upstream)),
+            (
+                "https uri sent as written",
+                Some("https://api.greendale.example/v1/"),
+                Some("https://api.greendale.example/v1/"),
+            ),
+            (
+                "urn",
+                Some("urn:greendale:human-being-api"),
+                Some("urn:greendale:human-being-api"),
+            ),
+            (
+                "no trailing slash normalization",
+                Some("https://api.greendale.example"),
+                Some("https://api.greendale.example"),
+            ),
+        ];
+        for (name, resource, want) in cases {
+            let oauth2 = oauth2_with_resource(*resource);
+            assert_eq!(
+                resolve_oauth2_resource(&oauth2, upstream),
+                Ok(*want),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_oauth2_resource_invalid() {
+        let upstream = "https://api.greendale.example";
+        let cases: &[(&str, &str, &str)] = &[
+            ("empty", "", "must not be empty"),
+            ("crlf", "urn:greendale:x\r\nX-Evil: 1", "control"),
+            ("lf", "urn:greendale:x\n", "control"),
+            ("tab", "urn:greendale:\tx", "control"),
+            ("space", "urn:greendale: x", "whitespace"),
+            ("relative path", "/api/v1", "absolute URI"),
+            ("bare host", "api.greendale.example", "absolute URI"),
+            ("wrong case sentinel", "Upstream", "absolute URI"),
+            ("scheme only", "urn:", "absolute URI"),
+            ("https without host", "https://", "absolute URI"),
+            (
+                "fragment",
+                "https://api.greendale.example/#study-room",
+                "fragment",
+            ),
+            (
+                "query",
+                "https://api.greendale.example/?dean=pelton",
+                "query",
+            ),
+        ];
+        for (name, resource, want) in cases {
+            let oauth2 = oauth2_with_resource(Some(resource));
+            let err = resolve_oauth2_resource(&oauth2, upstream)
+                .expect_err(&format!("{name} should be rejected"));
+            assert!(err.contains(want), "{name}: {err}");
+        }
+    }
+
+    #[test]
+    fn test_resolve_oauth2_resource_validates_upstream_value() {
+        let oauth2 = oauth2_with_resource(Some(OAUTH2_RESOURCE_UPSTREAM));
+        let cases: &[(&str, &str)] = &[
+            ("https://api.greendale.example/?campus=main", "query"),
+            ("https://api.greendale.example/#paintball", "fragment"),
+        ];
+        for (upstream, want) in cases {
+            let err = resolve_oauth2_resource(&oauth2, upstream).unwrap_err();
+            assert!(err.contains("\"upstream\""), "{upstream}: {err}");
+            assert!(err.contains(want), "{upstream}: {err}");
+        }
+    }
+
+    #[test]
+    fn test_resolve_oauth2_resource_rejects_extra_params_resource() {
+        let mut oauth2 = oauth2_with_resource(Some("urn:greendale:human-being-api"));
+        oauth2
+            .extra_params
+            .insert("resource".to_string(), "urn:greendale:other".to_string());
+        let err = resolve_oauth2_resource(&oauth2, "https://api.greendale.example").unwrap_err();
+        assert!(err.contains("mutually exclusive"), "{err}");
+    }
+
+    #[test]
+    fn test_resolve_oauth2_resource_unset_ignores_extra_params() {
+        let mut oauth2 = oauth2_with_resource(None);
+        oauth2
+            .extra_params
+            .insert("resource".to_string(), "urn:greendale:other".to_string());
+        assert_eq!(
+            resolve_oauth2_resource(&oauth2, "https://api.greendale.example"),
+            Ok(None)
+        );
     }
 
     #[test]
